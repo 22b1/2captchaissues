@@ -1,0 +1,803 @@
+provide the code, so i can fetch here: using NAudio.CoreAudioApi;
+using craftersmine.SteamGridDBNet;
+using MySql.Data.MySqlClient;
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.IO;
+using System.Linq;
+using System.Net.Http;
+using System.Text;
+using System.Text.Json;
+using System.Threading.Tasks;
+using System.Windows;
+using System.Windows.Controls;
+using System.Windows.Media;
+using System.Windows.Media.Animation;
+using System.Windows.Media.Imaging;
+using System.Windows.Threading;
+using GameFinder.RegistryUtils;
+using GameFinder.StoreHandlers.Steam;
+using System.Windows.Input;
+
+namespace UltimateTweaksApp.Windows
+{
+    public partial class GamingMode : Window
+    {
+        private DispatcherTimer timer;
+        private MMDeviceEnumerator enumerator;
+        private MMDevice audioDevice;
+        private const string STEAM_API_KEY = "BEECDFDF3654C743CA446F18013D8632";
+        private const string BASE_URL = "https://store.steampowered.com/api";
+        // AI endpoint to rank games by monthly active player count.
+        private const string AI_POPULARITY_ENDPOINT = "https://your-ai-api.com/get_popularity";
+        // If you need to use RAWG API as fallback for images, replace the key below.
+        private const string RAWG_API_KEY = "YOUR_RAWG_API_KEY";
+
+        private readonly Brush SelectedBackground = (Brush)new BrushConverter().ConvertFromString("#66031C1C");
+        private readonly Brush SelectedForeground = (Brush)Application.Current.FindResource("LinkColor");
+        private readonly Brush UnselectedBackground = Brushes.Transparent;
+        private readonly Brush UnselectedForeground = Brushes.White;
+
+        public GamingMode()
+        {
+            InitializeComponent();
+            LoadImageFromUrl(tempsaves.Default.ProfileImage);
+            StartClock();
+
+            enumerator = new MMDeviceEnumerator();
+            audioDevice = enumerator.GetDefaultAudioEndpoint(DataFlow.Render, Role.Multimedia);
+
+            // Sync initial slider value with system volume
+            pcVolume.Value = audioDevice.AudioEndpointVolume.MasterVolumeLevelScalar * 100;
+            UpdateVolumeIcon(pcVolume.Value);
+        }
+
+        private void StartClock()
+        {
+            timer = new DispatcherTimer();
+            timer.Interval = TimeSpan.FromSeconds(1);
+            timer.Tick += Timer_Tick;
+            timer.Start();
+            txtTime.Text = DateTime.Now.ToString("HH:mm");
+        }
+
+        private void Timer_Tick(object sender, EventArgs e)
+        {
+            txtTime.Text = DateTime.Now.ToString("HH:mm");
+        }
+
+        private void LoadImageFromUrl(string imageUrl)
+        {
+            Uri imageUri = new Uri(imageUrl, UriKind.Absolute);
+            BitmapImage bitmapImage = new BitmapImage(imageUri);
+            pfpImage.Source = bitmapImage;
+        }
+
+        private async void Window_Loaded(object sender, RoutedEventArgs e)
+        {
+            // Load installed games and rank them using AI
+            List<GameInfoCurrent> topGames = await LoadInstalledGamesByPopularity();
+            if (topGames.Any())
+            {
+                // Try to get a trailer using Steam; if not found, fallback to YouTube.
+                string videoUrl = await GetTrailer(topGames[0].Name);
+                if (!string.IsNullOrEmpty(videoUrl))
+                {
+                    PlayTrailer(videoUrl);
+                }
+                else
+                {
+                    MessageBox.Show("No trailer found for " + topGames[0].Name);
+                }
+            }
+            else
+            {
+                MessageBox.Show("No installed games found.");
+            }
+        }
+
+        private void PlayTrailer(string videoUrl)
+        {
+            mediaElementTrailer.Source = new Uri(videoUrl);
+            mediaElementTrailer.LoadedBehavior = MediaState.Manual;
+            mediaElementTrailer.MediaEnded += VideoPlayer_MediaEnded;
+            mediaElementTrailer.Opacity = 0; // Start hidden
+
+            mediaElementTrailer.Play();
+
+            // Fade-in effect
+            DoubleAnimation fadeIn = new DoubleAnimation(0, 1, TimeSpan.FromSeconds(1.5));
+            mediaElementTrailer.BeginAnimation(UIElement.OpacityProperty, fadeIn);
+        }
+
+        private void VideoPlayer_MediaEnded(object sender, RoutedEventArgs e)
+        {
+            DoubleAnimation fadeOut = new DoubleAnimation(1, 0, TimeSpan.FromSeconds(1.5));
+            fadeOut.Completed += (s, _) =>
+            {
+                mediaElementTrailer.Position = TimeSpan.Zero;
+                mediaElementTrailer.Play();
+                DoubleAnimation fadeIn = new DoubleAnimation(0, 1, TimeSpan.FromSeconds(1.5));
+                mediaElementTrailer.BeginAnimation(UIElement.OpacityProperty, fadeIn);
+            };
+
+            mediaElementTrailer.BeginAnimation(UIElement.OpacityProperty, fadeOut);
+        }
+
+        // First try to get the trailer from Steam; if not available, fallback to YouTube.
+        private async Task<string> GetTrailer(string gameName)
+        {
+            string trailerUrl = await GetSteamTrailer(gameName);
+            if (string.IsNullOrEmpty(trailerUrl))
+            {
+                trailerUrl = await GetYouTubeTrailer(gameName);
+            }
+            return trailerUrl;
+        }
+
+        private async Task<string> GetSteamTrailer(string gameName)
+        {
+            using (HttpClient client = new HttpClient())
+            {
+                try
+                {
+                    // 1️⃣ Search for the game directly on Steam
+                    string searchUrl = $"https://store.steampowered.com/api/storesearch/?term={Uri.EscapeDataString(gameName)}&cc=us&l=en";
+                    HttpResponseMessage searchResponse = await client.GetAsync(searchUrl);
+
+                    if (!searchResponse.IsSuccessStatusCode)
+                        throw new Exception("Failed to fetch Steam search results.");
+
+                    string searchJson = await searchResponse.Content.ReadAsStringAsync();
+                    JsonDocument searchDoc = JsonDocument.Parse(searchJson);
+
+                    if (!searchDoc.RootElement.TryGetProperty("items", out JsonElement items) || items.GetArrayLength() == 0)
+                        throw new Exception($"Game '{gameName}' not found on Steam.");
+
+                    string gameId = items[0].GetProperty("id").ToString(); // Get first match
+
+                    // 2️⃣ Fetch game details using AppID
+                    string detailsUrl = $"https://store.steampowered.com/api/appdetails?appids={gameId}";
+                    HttpResponseMessage detailsResponse = await client.GetAsync(detailsUrl);
+
+                    if (!detailsResponse.IsSuccessStatusCode)
+                        throw new Exception("Failed to fetch game details.");
+
+                    string detailsJson = await detailsResponse.Content.ReadAsStringAsync();
+                    JsonDocument detailsDoc = JsonDocument.Parse(detailsJson);
+                    var gameData = detailsDoc.RootElement.GetProperty(gameId).GetProperty("data");
+
+                    if (!gameData.TryGetProperty("movies", out JsonElement movieData) || movieData.GetArrayLength() == 0)
+                        throw new Exception($"No trailers available for '{gameName}'.");
+
+                    // 3️⃣ Extract the highest quality MP4 URL
+                    string videoUrl = movieData[0].GetProperty("mp4").GetProperty("max").GetString();
+
+                    return videoUrl;
+                }
+                catch (Exception ex)
+                {
+                    Debug.WriteLine("Steam trailer error: " + ex.Message);
+                    return null;
+                }
+            }
+        }
+
+        // Fallback function to search for a trailer on YouTube.
+        private async Task<string> GetYouTubeTrailer(string gameName)
+        {
+            using (HttpClient client = new HttpClient())
+            {
+                try
+                {
+                    // For demonstration purposes, we'll simulate a YouTube search.
+                    // Replace this with an actual YouTube Data API request if available.
+                    string query = Uri.EscapeDataString(gameName + " trailer");
+                    string youTubeUrl = $"https://www.youtube.com/results?search_query={query}";
+                    // In an actual implementation, you would parse the YouTube search results
+                    // and extract the URL of the first video.
+                    // Here, we return a sample URL:
+                    return "https://www.youtube.com/watch?v=dQw4w9WgXcQ";
+                }
+                catch (Exception ex)
+                {
+                    Debug.WriteLine("YouTube trailer error: " + ex.Message);
+                    return null;
+                }
+            }
+        }
+
+        private void Slider_ValueChanged(object sender, RoutedPropertyChangedEventArgs<double> e)
+        {
+            if (audioDevice != null)
+            {
+                audioDevice.AudioEndpointVolume.MasterVolumeLevelScalar = (float)(pcVolume.Value / 100.0);
+            }
+            UpdateVolumeIcon(pcVolume.Value);
+        }
+
+        private void UpdateVolumeIcon(double volume)
+        {
+            if (volume == 0)
+                volumeIcon.Source = new Uri("pack://application:,,,/Windows/Assets/volume-cross.svg");
+            else if (volume > 80)
+                volumeIcon.Source = new Uri("pack://application:,,,/Windows/Assets/volume-high.svg");
+            else if (volume > 50)
+                volumeIcon.Source = new Uri("pack://application:,,,/Windows/Assets/volume-low.svg");
+            else
+                volumeIcon.Source = new Uri("pack://application:,,,/Windows/Assets/volume-mute.svg");
+        }
+
+        private void VolumeIcon_Click(object sender, MouseButtonEventArgs e)
+        {
+            if (pcVolume.Visibility == Visibility.Collapsed)
+            {
+                // Fade in slider
+                pcVolume.Visibility = Visibility.Visible;
+                DoubleAnimation fadeIn = new DoubleAnimation(1, TimeSpan.FromSeconds(0.2));
+                pcVolume.BeginAnimation(OpacityProperty, fadeIn);
+            }
+            else
+            {
+                // Fade out slider
+                DoubleAnimation fadeOut = new DoubleAnimation(0, TimeSpan.FromSeconds(0.1));
+                fadeOut.Completed += (s, _) => pcVolume.Visibility = Visibility.Collapsed;
+                pcVolume.BeginAnimation(OpacityProperty, fadeOut);
+            }
+        }
+
+        private void HideAllPages()
+        {
+            HomePage.Visibility = Visibility.Collapsed;
+            GamesPage.Visibility = Visibility.Collapsed;
+            AppsPage.Visibility = Visibility.Collapsed;
+        }
+
+        private void ResetButtonStyles()
+        {
+            btnHome.NormalBackground = UnselectedBackground;
+            btnHome.NormalForeground = UnselectedForeground;
+            btnGames.NormalBackground = UnselectedBackground;
+            btnGames.NormalForeground = UnselectedForeground;
+            btnApps.NormalBackground = UnselectedBackground;
+            btnApps.NormalForeground = UnselectedForeground;
+        }
+
+        // Apply selected style to a specific button.
+        private void SetSelectedButton(CustomMenuButton selectedButton)
+        {
+            ResetButtonStyles();
+            selectedButton.NormalBackground = SelectedBackground;
+            selectedButton.NormalForeground = SelectedForeground;
+        }
+
+        private void btnHome_Click(object sender, RoutedEventArgs e)
+        {
+            HideAllPages();
+            HomePage.Visibility = Visibility.Visible;
+            SetSelectedButton(btnHome);
+        }
+
+        private void btnGames_Click(object sender, RoutedEventArgs e)
+        {
+            HideAllPages();
+            GamesPage.Visibility = Visibility.Visible;
+            SetSelectedButton(btnGames);
+        }
+
+        private void btnApps_Click(object sender, RoutedEventArgs e)
+        {
+            HideAllPages();
+            AppsPage.Visibility = Visibility.Visible;
+            SetSelectedButton(btnApps);
+        }
+
+        ////////////////////////////////////////////////////////////////////////////////
+        // NEW FUNCTIONS: Load Installed Games via GameFinder and Rank via AI Chatbot
+        ////////////////////////////////////////////////////////////////////////////////
+
+        private async Task<List<GameInfoCurrent>> LoadInstalledGamesByPopularity()
+        {
+            List<GameInfoCurrent> allGames = new List<GameInfoCurrent>();
+
+            try
+            {
+                var fileSystem = FileSystem.Shared;
+                var registry = WindowsRegistry.Shared;
+                var steamHandler = new SteamHandler(fileSystem, registry);
+                foreach (var result in steamHandler.FindAllGames())
+                {
+                    result.Switch(game =>
+                    {
+                        if (!string.IsNullOrWhiteSpace(game.Name) &&
+                            !game.Name.ToLower().Contains("minecraft launcher"))
+                        {
+                            allGames.Add(new GameInfoCurrent { Library = "Steam", Name = game.Name });
+                        }
+                    }, error => { });
+                }
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show("Error fetching installed games: " + ex.Message);
+            }
+
+            allGames = allGames.GroupBy(g => g.Name.Trim().ToLower())
+                               .Select(g => g.First())
+                               .ToList();
+
+            
+            List<GameInfoCurrent> rankedGames = await GetGamePopularityFromAI(allGames);
+            
+            return rankedGames.OrderByDescending(g => g.Popularity).Take(5).ToList();
+        }
+
+
+        private async Task<List<GameInfoCurrent>> GetGamePopularityFromAI(List<GameInfoCurrent> games)
+        {
+            using (HttpClient client = new HttpClient())
+            {
+                try
+                {
+                    // Build the prompt from the installed games list.
+                    string prompt = GenerateAIPrompt(games);
+                    var requestBody = new { prompt = prompt };
+                    string json = JsonSerializer.Serialize(requestBody);
+                    var content = new StringContent(json, Encoding.UTF8, "application/json");
+
+                    // Use your AI Chat endpoint.
+                    HttpResponseMessage response = await client.PostAsync("https://api.ultimatetweaks.com/ai/chat.php", content);
+                    if (!response.IsSuccessStatusCode)
+                    {
+                        MessageBox.Show("Error fetching game popularity from AI.");
+                        return games;
+                    }
+                    string responseJson = await response.Content.ReadAsStringAsync();
+                    using JsonDocument doc = JsonDocument.Parse(responseJson);
+                    // Expected response format:
+                    // { "ranked_games": [ { "name": "GameName", "player_count": 123456 }, ... ] }
+                    var rankedGamesArray = doc.RootElement.GetProperty("ranked_games").EnumerateArray();
+                    List<GameInfoCurrent> rankedGames = new List<GameInfoCurrent>();
+                    foreach (var item in rankedGamesArray)
+                    {
+                        rankedGames.Add(new GameInfoCurrent
+                        {
+                            Name = item.GetProperty("name").GetString(),
+                            Popularity = item.GetProperty("player_count").GetDouble()
+                        });
+                    }
+                    return rankedGames;
+                }
+                catch (Exception ex)
+                {
+                    MessageBox.Show("Error in AI popularity function: " + ex.Message);
+                    return games;
+                }
+            }
+        }
+
+        private string GenerateAIPrompt(List<GameInfoCurrent> games)
+        {
+            StringBuilder prompt = new StringBuilder();
+            prompt.AppendLine("Below is a list of installed games:");
+            foreach (var game in games)
+            {
+                prompt.AppendLine("- " + game.Name);
+            }
+            prompt.AppendLine("Please rank these games by their monthly active player count. For games that are not found on Steam, use available YouTube data.");
+            prompt.AppendLine("Return the results in JSON format as follows:");
+            prompt.AppendLine("{ \"ranked_games\": [ { \"name\": \"GameName\", \"player_count\": 123456 }, ... ] }");
+            return prompt.ToString();
+        }
+    }
+
+    public class GameInfoCurrent
+    {
+        public string Name { get; set; }
+        public string Library { get; set; }
+        public double Popularity { get; set; } = 0.0;
+    }
+}
+
+
+user installed games, also after getting the most popular games populate the list with this elements: using craftersmine.SteamGridDBNet;
+using MySql.Data.MySqlClient;
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.IO;
+using System.Linq;
+using System.Net.Http;
+using System.Text;
+using System.Threading.Tasks;
+using System.Windows;
+using System.Windows.Controls;
+using System.Windows.Data;
+using System.Windows.Documents;
+using System.Windows.Input;
+using System.Windows.Media;
+using System.Windows.Media.Animation;
+using System.Windows.Media.Imaging;
+using System.Windows.Navigation;
+using System.Windows.Shapes;
+
+namespace UltimateTweaksApp.Windows
+{
+    /// <summary>
+    /// Interaction logic for GameModeCardElement.xaml
+    /// </summary>
+    public partial class GameModeCardElement : UserControl
+    {
+        private string gameTitleGlb = string.Empty;
+
+        private const string SGDB_API_KEY = "08faeb8fac08d0fe0d45f8aeb044c32e";
+        private static SteamGridDb sgdbClient = new SteamGridDb(SGDB_API_KEY);
+
+        private const string connectionString = "Server=191.96.94.5;Database=ultimate1_main;User Id=ultimate1_mainuser;Password=g7gQ6uq%hOr;";
+
+        // Make these constants public so they can be accessed from outside
+        public const double DefaultWidth = 140;
+        public const double DefaultHeight = 200;
+        public const double SelectedWidth = 190;
+        public const double SelectedHeight = 270;
+        private const int AnimationDurationMs = 300;
+
+        private static Dictionary<string, BitmapImage> imageCache = new Dictionary<string, BitmapImage>();
+
+        public GameModeCardElement()
+        {
+            InitializeComponent();
+
+            // Set initial dimensions explicitly
+            this.Width = DefaultWidth;
+            this.Height = DefaultHeight;
+        }
+
+        public async void SetGame(GameInfo game)
+        {
+            if (game == null)
+                return;
+
+            gameTitleGlb = game.Name;
+
+            BitmapImage bannerImage = await GetGameBannerAsync(game.Name);
+
+            if (bannerImage != null)
+            {
+                mainBorder.Background = new ImageBrush(bannerImage)
+                {
+                    Stretch = Stretch.UniformToFill
+                };
+            }
+            else
+            {
+                // Set a default background if no image is found
+                mainBorder.Background = new SolidColorBrush(Colors.DarkGray);
+            }
+        }
+
+        /// <summary>
+        /// Animates the card to the selected state.
+        /// </summary>
+        public void AnimateSelect()
+        {
+            AnimateSize(SelectedWidth, SelectedHeight);
+
+            // Use a brighter color to highlight selection
+            AnimateBorderColor(Colors.Yellow);
+        }
+
+        /// <summary>
+        /// Animates the card to the deselected state.
+        /// </summary>
+        public void AnimateDeselect()
+        {
+            AnimateSize(DefaultWidth, DefaultHeight);
+
+            // Retrieve the default border color from resources.
+            var defaultBrush = Application.Current.Resources["StrokeMain"] as SolidColorBrush;
+            Color defaultColor = defaultBrush != null ? defaultBrush.Color : Colors.White;
+            AnimateBorderColor(defaultColor);
+        }
+
+        /// <summary>
+        /// Animates the width and height of the card.
+        /// </summary>
+        private void AnimateSize(double targetWidth, double targetHeight)
+        {
+            // Ensure we have valid starting dimensions
+            double startWidth = double.IsNaN(this.Width) || this.Width <= 0 ? DefaultWidth : this.Width;
+            double startHeight = double.IsNaN(this.Height) || this.Height <= 0 ? DefaultHeight : this.Height;
+
+            // Set current size if it's not already set
+            if (double.IsNaN(this.Width) || this.Width <= 0)
+                this.Width = startWidth;
+
+            if (double.IsNaN(this.Height) || this.Height <= 0)
+                this.Height = startHeight;
+
+            // Create animations with explicit From values
+            var widthAnim = new DoubleAnimation
+            {
+                From = startWidth,
+                To = targetWidth,
+                Duration = TimeSpan.FromMilliseconds(AnimationDurationMs),
+                EasingFunction = new QuadraticEase() // Add easing for smoother animation
+            };
+
+            var heightAnim = new DoubleAnimation
+            {
+                From = startHeight,
+                To = targetHeight,
+                Duration = TimeSpan.FromMilliseconds(AnimationDurationMs),
+                EasingFunction = new QuadraticEase() // Add easing for smoother animation
+            };
+
+            this.BeginAnimation(WidthProperty, widthAnim);
+            this.BeginAnimation(HeightProperty, heightAnim);
+        }
+
+        /// <summary>
+        /// Animates the border color to the target color.
+        /// </summary>
+        private void AnimateBorderColor(Color targetColor)
+        {
+            // Ensure mainBorder.BorderBrush is a SolidColorBrush.
+            if (!(mainBorder.BorderBrush is SolidColorBrush currentBrush))
+            {
+                currentBrush = new SolidColorBrush(Colors.White);
+                mainBorder.BorderBrush = currentBrush;
+            }
+
+            // Get the current color or use a default
+            Color currentColor = currentBrush.Color;
+
+            // Create new SolidColorBrush that can be animated
+            var animatableBrush = new SolidColorBrush(currentColor);
+            mainBorder.BorderBrush = animatableBrush;
+
+            var colorAnim = new ColorAnimation
+            {
+                From = currentColor,
+                To = targetColor,
+                Duration = TimeSpan.FromMilliseconds(AnimationDurationMs)
+            };
+
+            animatableBrush.BeginAnimation(SolidColorBrush.ColorProperty, colorAnim);
+        }
+
+        private async Task<BitmapImage> GetGameBannerAsync(string gameName)
+        {
+            try
+            {
+                // Check cache first
+                if (imageCache.TryGetValue(gameName, out BitmapImage cachedImage))
+                {
+                    return cachedImage;
+                }
+
+                string imageUrl = await GetCustomImageFromDatabase(gameName);
+                if (string.IsNullOrEmpty(imageUrl))
+                {
+                    var searchResults = await sgdbClient.SearchForGamesAsync(gameName);
+                    if (searchResults == null || searchResults.Length == 0)
+                    {
+                        Debug.WriteLine($"Game not found: {gameName}");
+
+                        // Try RAWG API as fallback
+                        imageUrl = await GetImageFromRawg(gameName);
+                        if (string.IsNullOrEmpty(imageUrl))
+                        {
+                            return null;
+                        }
+                    }
+                    else
+                    {
+                        int gameId = searchResults[0].Id;
+                        var grids = await sgdbClient.GetGridsByGameIdAsync(gameId, dimensions: SteamGridDbDimensions.AllGrids);
+
+                        if (grids == null || grids.Length == 0)
+                        {
+                            Debug.WriteLine($"No images found for game: {gameName}");
+
+                            // Try RAWG API as fallback
+                            imageUrl = await GetImageFromRawg(gameName);
+                            if (string.IsNullOrEmpty(imageUrl))
+                            {
+                                return null;
+                            }
+                        }
+                        else
+                        {
+                            imageUrl = grids[0].FullImageUrl;
+                        }
+                    }
+                }
+
+                // Download and process image
+                BitmapImage bitmap = await DownloadImageAsync(imageUrl);
+
+                // Add to cache
+                if (bitmap != null)
+                {
+                    imageCache[gameName] = bitmap;
+                }
+
+                return bitmap;
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"Error fetching image for {gameName}: {ex.Message}");
+                return null;
+            }
+        }
+
+        private async Task<string> GetImageFromRawg(string gameName)
+        {
+            try
+            {
+                string apiKey = "YOUR_RAWG_API_KEY"; // Replace with your RAWG API key
+                string url = $"https://api.rawg.io/api/games?search={Uri.EscapeDataString(gameName)}&key={apiKey}";
+
+                var client = new HttpClient();
+                var response = await client.GetStringAsync(url);
+
+                var jsonDoc = System.Text.Json.JsonDocument.Parse(response);
+                var results = jsonDoc.RootElement.GetProperty("results");
+
+                if (results.GetArrayLength() > 0)
+                {
+                    var firstGame = results[0];
+                    if (firstGame.TryGetProperty("background_image", out var imageElement))
+                    {
+                        return imageElement.GetString();
+                    }
+                }
+
+                return null;
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"Error fetching RAWG image for {gameName}: {ex.Message}");
+                return null;
+            }
+        }
+
+        private async Task<BitmapImage> DownloadImageAsync(string imageUrl)
+        {
+            try
+            {
+                byte[] imageData = await new HttpClient().GetByteArrayAsync(imageUrl);
+                using (var ms = new MemoryStream(imageData))
+                {
+                    var bitmap = new BitmapImage();
+                    bitmap.BeginInit();
+                    bitmap.CacheOption = BitmapCacheOption.OnLoad;
+                    bitmap.StreamSource = ms;
+                    bitmap.EndInit();
+                    bitmap.Freeze(); // Important for cross-thread usage
+                    return bitmap;
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"Error downloading image from {imageUrl}: {ex.Message}");
+                return null;
+            }
+        }
+
+        private async Task<string> GetCustomImageFromDatabase(string gameName)
+        {
+            string imageUrl = string.Empty;
+            string query = "SELECT image_url FROM custom_images WHERE game_name = @gameName LIMIT 1";
+            try
+            {
+                using (MySqlConnection conn = new MySqlConnection(connectionString))
+                {
+                    await conn.OpenAsync();
+                    using (MySqlCommand cmd = new MySqlCommand(query, conn))
+                    {
+                        cmd.Parameters.AddWithValue("@gameName", gameName);
+                        using (var reader = await cmd.ExecuteReaderAsync())
+                        {
+                            if (await reader.ReadAsync())
+                            {
+                                imageUrl = reader["image_url"].ToString();
+                            }
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"Error retrieving custom image URL: {ex.Message}");
+            }
+            return imageUrl;
+        }
+
+        public void SetBorderColor(SolidColorBrush brush)
+        {
+            mainBorder.BorderBrush = brush;
+        }
+
+        public void ResetBorderColor()
+        {
+            mainBorder.BorderBrush = (SolidColorBrush)Application.Current.Resources["StrokeMain"];
+        }
+    }
+}
+
+
+
+
+
+<UserControl x:Class="UltimateTweaksApp.Windows.GameModeCardElement"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006" 
+             xmlns:d="http://schemas.microsoft.com/expression/blend/2008" 
+             xmlns:local="clr-namespace:UltimateTweaksApp.Windows"
+             mc:Ignorable="d" 
+             d:DesignHeight="270" d:DesignWidth="190">
+    <Border x:Name="mainBorder" CornerRadius="16"
+            BorderBrush="{StaticResource StrokeMain}"
+            BorderThickness="2">
+            
+    </Border>
+</UserControl>
+
+
+
+here:             <Grid x:Name="HomePage">
+                <StackPanel x:Name="gamesList" Margin="50" Orientation="Horizontal" HorizontalAlignment="Left" VerticalAlignment="Top">
+                    <Border x:Name="mainBorder" CornerRadius="16" Height="270" Width="190"
+            BorderBrush="{StaticResource StrokeMain}"
+            BorderThickness="2">
+                        <Border.Background>
+                            <ImageBrush ImageSource="/Windows/MV5BYjdlZjZlMTQtMTQwNS00MTBjLWE3YjQtM2Y3NjQ5ZWEzMzRmXkEyXkFqcGc@._V1_FMjpg_UX1000_.jpg"/>
+                        </Border.Background>
+                    </Border>
+
+                    <Border CornerRadius="16" Height="200" Width="140" Margin="10,0,0,0" VerticalAlignment="Top"
+            BorderBrush="{StaticResource StrokeMain}"
+            BorderThickness="2">
+                        <Border.Background>
+                            <ImageBrush ImageSource="/Windows/co5ztm.png"/>
+                        </Border.Background>
+                    </Border>
+
+                    <Border CornerRadius="16" Height="200" Width="140" Margin="10,0,0,0" VerticalAlignment="Top"
+            BorderBrush="{StaticResource StrokeMain}"
+            BorderThickness="2">
+                        <Border.Background>
+                            <ImageBrush ImageSource="/Windows/co1niz.png"/>
+                        </Border.Background>
+                    </Border>
+
+                    <Border CornerRadius="16" Height="200" Width="140" Margin="10,0,0,0" VerticalAlignment="Top"
+            BorderBrush="{StaticResource StrokeMain}"
+            BorderThickness="2">
+                        <Border.Background>
+                            <ImageBrush ImageSource="/Windows/co1y2f.png"/>
+                        </Border.Background>
+                    </Border>
+
+                    <Border CornerRadius="16" Height="200" Width="140" Margin="10,0,0,0" VerticalAlignment="Top"
+            BorderBrush="{StaticResource StrokeMain}"
+            BorderThickness="2">
+                        <Border.Background>
+                            <ImageBrush ImageSource="/Windows/co79r3.png"/>
+                        </Border.Background>
+                    </Border>
+
+                    <Border CornerRadius="16" Height="200" Width="140" Margin="10,0,0,0" VerticalAlignment="Top"
+            BorderBrush="{StaticResource StrokeMain}"
+            BorderThickness="2" Background="#33FFFFFF">
+                        <TextBlock Text="See all" HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                    </Border>
+
+                </StackPanel>
+
+
+remove the dummyes
